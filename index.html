@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mood from Typing</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 2rem; max-width: 800px; }
+    .metrics { display: grid; grid-template-columns: repeat(2, minmax(200px,1fr)); gap: 12px; margin-top: 1rem; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    textarea { width: 100%; min-height: 140px; padding: 12px; font-size: 16px; }
+    .mood { font-size: 1.4rem; margin-top: 1rem; }
+    .badge { display: inline-block; padding: 2px 8px; border: 1px solid #ccc; border-radius: 999px; margin-right: 6px; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .small { color:#666; font-size: 0.9rem; }
+    .cal-block { margin: 10px 0; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Typing Mood Detector</h1>
+  <p class="small">
+    Type the paragraph below at your natural pace. The app tracks keystroke timing locally (no upload).
+  </p>
+
+  <div class="cal-block card">
+    <strong>Step 1 — 15s Calibration (optional):</strong>
+    <div class="row">
+      <button id="startCal">Start calibration</button>
+      <span id="calStatus" class="small">Not started</span>
+    </div>
+    <div class="small">Calibration builds your personal baseline speed/variability so results fit you better.</div>
+  </div>
+
+  <div class="card">
+    <label for="prompt"><strong>Prompt (you can edit):</strong></label>
+    <div id="prompt" class="small" style="margin:6px 0 10px">
+      “Write a few sentences about what you did today.”
+    </div>
+    <textarea id="box" placeholder="Start typing here..."></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="reset">Reset</button>
+      <span class="small">Tip: type continuously for ~30–60s for a more stable reading.</span>
+    </div>
+  </div>
+
+  <div class="metrics">
+    <div class="card"><strong>WPM</strong><div id="wpm">0</div></div>
+    <div class="card"><strong>Avg Inter-key (ms)</strong><div id="avgIk">0</div></div>
+    <div class="card"><strong>Burstiness (σ of inter-key, ms)</strong><div id="burst">0</div></div>
+    <div class="card"><strong>Long Pauses (≥2000ms)</strong><div id="pauses">0</div></div>
+    <div class="card"><strong>Backspace Rate (%)</strong><div id="backs">0</div></div>
+    <div class="card"><strong>Avg Dwell (KeyDown→KeyUp, ms)</strong><div id="dwell">0</div></div>
+  </div>
+
+  <div class="card mood">
+    <div><strong>Mood:</strong> <span id="mood">—</span></div>
+    <div class="small" id="explain">Start typing to see analysis.</div>
+  </div>
+
+<script>
+(() => {
+  const box = document.getElementById('box');
+  const wpmEl = document.getElementById('wpm');
+  const avgIkEl = document.getElementById('avgIk');
+  const burstEl = document.getElementById('burst');
+  const pausesEl = document.getElementById('pauses');
+  const backsEl = document.getElementById('backs');
+  const dwellEl = document.getElementById('dwell');
+  const moodEl = document.getElementById('mood');
+  const explainEl = document.getElementById('explain');
+  const resetBtn = document.getElementById('reset');
+  const startCalBtn = document.getElementById('startCal');
+  const calStatus = document.getElementById('calStatus');
+
+  // Data buffers
+  let interKey = [];          // flight times: time between key presses
+  let dwellTimes = {};        // temp map for keydown timestamps
+  let dwellList = [];         // key hold durations
+  let backspaces = 0;
+  let longPauses = 0;
+  let chars = 0;
+  let words = 0;
+  let lastDownTime = null;
+  let startTime = null;
+
+  // Personal baselines (filled by calibration)
+  let baseline = {
+    wpm: null,
+    sigma: null,
+  };
+  let calibrating = false;
+  let calTimer = null;
+  let calData = [];
+
+  function now() { return performance.now(); }
+
+  function mean(arr){ return arr.length? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
+  function stddev(arr){
+    const m = mean(arr);
+    const v = arr.length ? arr.reduce((a,b)=>a+(b-m)*(b-m),0)/arr.length : 0;
+    return Math.sqrt(v);
+  }
+
+  function computeWPM() {
+    if(!startTime) return 0;
+    const minutes = (now() - startTime) / 60000;
+    const wordCount = box.value.trim().length ? box.value.trim().split(/\s+/).length : 0;
+    words = wordCount;
+    return minutes > 0 ? (wordCount / minutes) : 0;
+  }
+
+  function updateUI() {
+    const wpm = computeWPM();
+    const avgIk = mean(interKey);
+    const sigmaIk = stddev(interKey);
+    const avgDwell = mean(dwellList);
+    const backRate = chars>0 ? (backspaces / chars) * 100 : 0;
+
+    wpmEl.textContent = wpm.toFixed(1);
+    avgIkEl.textContent = avgIk.toFixed(0);
+    burstEl.textContent = sigmaIk.toFixed(0);
+    pausesEl.textContent = longPauses.toString();
+    backsEl.textContent = backRate.toFixed(1);
+    dwellEl.textContent = avgDwell.toFixed(0);
+
+    const { label, why } = inferMood({ wpm, avgIk, sigmaIk, longPauses, backRate, avgDwell });
+    moodEl.textContent = label;
+    explainEl.textContent = why;
+  }
+
+  // Simple, explainable rule-based inference
+  function inferMood({ wpm, avgIk, sigmaIk, longPauses, backRate, avgDwell }) {
+    // Personalize thresholds if baseline exists; otherwise use generic ones
+    const baseWPM = baseline.wpm ?? 40;               // typical casual typing ~ 35–45 wpm
+    const baseSigma = baseline.sigma ?? 120;          // ms
+    const fast = wpm > baseWPM + 10;
+    const slow = wpm < baseWPM - 10;
+    const veryBursty = sigmaIk > (baseline.sigma ? baseline.sigma*1.4 : 170);
+    const steady = sigmaIk < (baseline.sigma ? baseline.sigma*0.75 : 90);
+    const manyPauses = longPauses >= 3;
+    const highBack = backRate > 6; // %
+    const longDwell = avgDwell > 140;
+    const shortDwell = avgDwell > 0 && avgDwell < 90;
+
+    // Heuristics (non-clinical)
+    if (fast && steady && !manyPauses && !highBack) {
+      return { label: "Focused / Flow 🧠", why: "Fast and steady typing with few pauses and low corrections." };
+    }
+    if (fast && veryBursty && highBack) {
+      return { label: "Hurried / Anxious ⚡", why: "Fast but irregular timing and many corrections." };
+    }
+    if (slow && manyPauses && longDwell) {
+      return { label: "Stressed / Fatigued 😵", why: "Slow pace with frequent long pauses and heavier key holds." };
+    }
+    if (steady && !manyPauses && !highBack && !slow) {
+      return { label: "Calm 🙂", why: "Consistent rhythm, few pauses, minimal backspaces." };
+    }
+    if (veryBursty || highBack || manyPauses) {
+      return { label: "Distracted 🤔", why: "Irregular timing, higher corrections or frequent pauses." };
+    }
+    return { label: "Neutral — need more data", why: "Keep typing for a clearer signal." };
+  }
+
+  function resetAll() {
+    interKey = [];
+    dwellTimes = {};
+    dwellList = [];
+    backspaces = 0;
+    longPauses = 0;
+    chars = 0;
+    words = 0;
+    lastDownTime = null;
+    startTime = null;
+    box.value = "";
+    updateUI();
+  }
+
+  box.addEventListener('keydown', (e) => {
+    const t = now();
+    if (!startTime) startTime = t;
+
+    // Inter-key interval (flight time between consecutive keydowns)
+    if (lastDownTime != null) {
+      const gap = t - lastDownTime;
+      interKey.push(gap);
+      if (gap >= 2000) longPauses++;
+    }
+    lastDownTime = t;
+
+    // Count backspaces
+    if (e.key === 'Backspace') backspaces++;
+
+    // Start dwell timer for this physical key
+    dwellTimes[e.code] = t;
+  });
+
+  box.addEventListener('keyup', (e) => {
+    chars++;
+    const up = now();
+    const down = dwellTimes[e.code];
+    if (down) {
+      const dwell = up - down;
+      // filter extreme outliers (accidental holds)
+      if (dwell < 1500) dwellList.push(dwell);
+      delete dwellTimes[e.code];
+    }
+    updateUI();
+  });
+
+  resetBtn.addEventListener('click', resetAll);
+
+  // Calibration: record WPM + sigma over 15s and set baseline
+  startCalBtn.addEventListener('click', () => {
+    if (calibrating) return;
+    calibrating = true;
+    calData = [];
+    calStatus.textContent = "Calibrating… type naturally for 15s.";
+    const snap = () => {
+      const wpm = computeWPM();
+      const sigma = stddev(interKey);
+      if (wpm > 0 && sigma > 0 && isFinite(wpm) && isFinite(sigma)) {
+        calData.push({wpm, sigma});
+      }
+    };
+    calTimer = setInterval(snap, 1000);
+    setTimeout(() => {
+      clearInterval(calTimer);
+      calibrating = false;
+      if (calData.length >= 5) {
+        baseline.wpm = calData.map(d=>d.wpm).sort((a,b)=>a-b)[Math.floor(calData.length/2)];
+        baseline.sigma = calData.map(d=>d.sigma).sort((a,b)=>a-b)[Math.floor(calData.length/2)];
+        calStatus.textContent = `Baseline saved — WPM≈${baseline.wpm.toFixed(1)}, σ≈${baseline.sigma.toFixed(0)}ms.`;
+      } else {
+        calStatus.textContent = "Calibration inconclusive — try again.";
+      }
+    }, 15000);
+  });
+
+})();
+</script>
+</body>
+</html>
