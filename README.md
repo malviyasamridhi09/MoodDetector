@@ -1,4 +1,4 @@
-# Typing Speed Mood Detector
+# KeyMoody
 
 A simple web-based project that detects a user's mood based on typing speed and keystroke dynamics.
 
